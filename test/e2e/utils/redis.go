@@ -32,10 +32,10 @@ import (
 	"k8s.io/client-go/restmapper"
 )
 
-// EnsureRedis applies the Redis manifest at manifestPath and waits for its Deployment
-// to become ready. Namespaced objects without a namespace land in the given one. The
-// returned cleanup deletes what this call created, newest first; preexisting objects
-// are left in place.
+// EnsureRedis applies the Redis manifest at manifestPath and waits for every Deployment
+// in it to become ready, each in the namespace it actually lands in. Namespaced objects
+// without a namespace land in the given one. The returned cleanup deletes what this call
+// created, newest first; preexisting objects are left in place.
 func EnsureRedis(t *testing.T, kubeClient kubernetes.Interface, namespace, manifestPath string) func() {
 	t.Helper()
 	ctx := context.Background()
@@ -56,12 +56,13 @@ func EnsureRedis(t *testing.T, kubeClient kubernetes.Interface, namespace, manif
 		name      string
 	}
 	createdRefs := make([]createdResourceRef, 0, len(redisObjects))
-	var redisDeploymentName string
+	type deploymentRef struct {
+		namespace string
+		name      string
+	}
+	deployments := make([]deploymentRef, 0, 1)
 
 	for _, obj := range redisObjects {
-		if obj.GetKind() == "Deployment" && redisDeploymentName == "" {
-			redisDeploymentName = obj.GetName()
-		}
 		gvk := obj.GroupVersionKind()
 		mapping, mapErr := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 		require.NoError(t, mapErr, "Failed to map GVK %s", gvk.String())
@@ -79,6 +80,12 @@ func EnsureRedis(t *testing.T, kubeClient kubernetes.Interface, namespace, manif
 			return resourceClient
 		}()
 
+		if obj.GetKind() == "Deployment" {
+			// Captured after the namespace resolves so the wait polls where the object
+			// actually lands, and before Create so preexisting Deployments still get waited on.
+			deployments = append(deployments, deploymentRef{namespace: namespaceToUse, name: obj.GetName()})
+		}
+
 		_, createErr := resource.Create(ctx, obj, metav1.CreateOptions{})
 		if createErr != nil {
 			require.True(t, apierrors.IsAlreadyExists(createErr), "Failed to create %s/%s: %v", gvk.Kind, obj.GetName(), createErr)
@@ -92,9 +99,11 @@ func EnsureRedis(t *testing.T, kubeClient kubernetes.Interface, namespace, manif
 		})
 	}
 
-	require.NotEmpty(t, redisDeploymentName, "Redis Deployment not found in manifest")
+	require.NotEmpty(t, deployments, "Redis Deployment not found in manifest")
 
-	WaitForDeploymentReady(t, ctx, kubeClient, namespace, redisDeploymentName, 1, 2*time.Minute)
+	for _, d := range deployments {
+		WaitForDeploymentReady(t, ctx, kubeClient, d.namespace, d.name, 1, 2*time.Minute)
+	}
 	t.Log("Redis is ready")
 
 	return func() {
