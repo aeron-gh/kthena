@@ -225,7 +225,7 @@ func (t *KVCacheAware) Stop() {
 }
 
 // parseGCDurationArg reads a duration plugin argument, falling back to the
-// default when it is unset, unparseable, or not positive. Each rejection names
+// default when it is unset, unparsable, or not positive. Each rejection names
 // the field, because the surrounding unmarshal drops every argument silently
 // when one of them is malformed.
 func parseGCDurationArg(field, raw string, fallback time.Duration) time.Duration {
@@ -234,7 +234,7 @@ func parseGCDurationArg(field, raw string, fallback time.Duration) time.Duration
 	}
 	value, err := time.ParseDuration(raw)
 	if err != nil {
-		klog.Warningf("KVCacheAware: ignoring unparseable %s %q, using %v: %v", field, raw, fallback, err)
+		klog.Warningf("KVCacheAware: ignoring unparsable %s %q, using %v: %v", field, raw, fallback, err)
 		return fallback
 	}
 	if value <= 0 {
