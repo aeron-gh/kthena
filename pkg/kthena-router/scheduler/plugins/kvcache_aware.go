@@ -87,13 +87,8 @@ type KVCacheAwareArgs struct {
 	// SGLangTokenizerPort overrides the default SGLang tokenizer port (30000).
 	SGLangTokenizerPort int `yaml:"sglangTokenizerPort,omitempty"`
 	// GCInterval overrides how often the ownership GC runs (default 1h).
-	// Any duration time.ParseDuration accepts, for example "30m".
 	GCInterval string `yaml:"gcInterval,omitempty"`
-	// GCFieldFreshDuration overrides how long an ownership field survives without
-	// a refresh before GC removes it (default 24h), same format as GCInterval.
-	// The default matches the runtime's mapping key expiry; lowering it only
-	// shortens how long ownership written by a departed pod lingers, it does not
-	// affect scoring, which filters owners by container start time.
+	// GCFieldFreshDuration overrides how long an unrefreshed ownership field survives (default 24h).
 	GCFieldFreshDuration string `yaml:"gcFieldFreshDuration,omitempty"`
 	// GCScanSize overrides the SCAN COUNT hint per round (default 100).
 	GCScanSize int64 `yaml:"gcScanSize,omitempty"`
@@ -214,8 +209,7 @@ func normalizeTokenizerPort(engine string, configuredPort, defaultPort int) int 
 	return defaultPort
 }
 
-// Stop halts the ownership GC goroutine. It is safe to call more than once, and
-// safe to call on a plugin whose GC never started.
+// Stop halts the GC goroutine; safe to call more than once.
 func (t *KVCacheAware) Stop() {
 	t.gcStopOnce.Do(func() {
 		if t.gcStopCh != nil {
@@ -224,10 +218,7 @@ func (t *KVCacheAware) Stop() {
 	})
 }
 
-// parseGCDurationArg reads a duration plugin argument, falling back to the
-// default when it is unset, unparsable, or not positive. Each rejection names
-// the field, because the surrounding unmarshal drops every argument silently
-// when one of them is malformed.
+// parseGCDurationArg parses a duration arg, falling back to the default when unset, unparsable, or not positive.
 func parseGCDurationArg(field, raw string, fallback time.Duration) time.Duration {
 	if raw == "" {
 		return fallback
@@ -244,9 +235,7 @@ func parseGCDurationArg(field, raw string, fallback time.Duration) time.Duration
 	return value
 }
 
-// The three helpers below let a zero-valued KVCacheAware keep the documented
-// defaults, so a plugin built without going through NewKVCacheAware behaves as
-// it did before these knobs existed.
+// The effective* helpers keep the documented defaults for a zero-valued KVCacheAware.
 
 func (t *KVCacheAware) effectiveGCInterval() time.Duration {
 	if t.gcInterval <= 0 {
