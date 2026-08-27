@@ -26,12 +26,6 @@ class EngineType(Enum):
 
 
 class StandardMetricNames:
-    # The runtime's parser munges counter families into their OpenMetrics
-    # form: the FAMILY name loses the _total suffix while samples keep it.
-    # Rules are matched by family name, so the counter rule is keyed by the
-    # munged family and RenameMetric's suffix arithmetic restores _total on
-    # the exposed samples, yielding the documented
-    # kthena:generation_tokens_total series.
     GENERATION_TOKENS = "kthena:generation_tokens"
     NUM_REQUESTS_WAITING = "kthena:num_requests_waiting"
     TIME_TO_FIRST_TOKEN_SECONDS = "kthena:time_to_first_token_seconds"
