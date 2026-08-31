@@ -518,9 +518,6 @@ func TestKVCacheAware_GCStaleFields_FullPassInOneTick(t *testing.T) {
 		redisClient: client,
 	}
 
-	// Seed well over kvCacheGCScanSize keys so a pass needs multiple SCAN batches.
-	// Each key keeps a fresh owner alongside the stale one so keys survive the pass
-	// (miniredis cursors are list indexes; deleting keys mid-scan would shift them).
 	ctx := context.Background()
 	now := fmt.Sprintf("%d", time.Now().Unix())
 	stale := fmt.Sprintf("%d", time.Now().Add(-25*time.Hour).Unix())
@@ -556,9 +553,6 @@ func TestKVCacheAware_GCStaleFields_FullPassInOneTick(t *testing.T) {
 
 	plugin.gcStaleFields()
 
-	// A transient client fault aborts a pass mid-way by design (the cursor resumes next
-	// tick), so allow one healing rerun before asserting. The rerun cannot mask the
-	// one-batch pacing this test pins: two one-batch ticks clear at most 200 of 250 keys.
 	staleLeft := countStale()
 	if staleLeft != 0 {
 		plugin.gcStaleFields()

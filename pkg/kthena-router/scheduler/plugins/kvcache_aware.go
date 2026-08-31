@@ -373,9 +373,7 @@ func (t *KVCacheAware) runGC() {
 	}
 }
 
-// gcStaleFields walks the keyspace with SCAN until the cursor wraps or the tick's
-// context budget runs out, so a full pass no longer takes one batch per hourly tick.
-// On budget exhaustion the cursor is kept and the next tick resumes from it.
+// gcStaleFields walks the keyspace with SCAN until the cursor wraps or the tick's context budget runs out.
 func (t *KVCacheAware) gcStaleFields() {
 	if t.redisClient == nil {
 		return
@@ -390,13 +388,16 @@ func (t *KVCacheAware) gcStaleFields() {
 			klog.V(4).Infof("KVCacheAware.gcStaleFields: scan failed: %v", err)
 			return
 		}
-		t.gcCursor = nextCursor
-
 		now := time.Now()
 		staleFields := make(map[string][]string)
+		interrupted := false
 		for _, key := range keys {
 			podTimes, err := t.redisClient.HGetAll(ctx, key).Result()
 			if err != nil {
+				if ctx.Err() != nil {
+					interrupted = true
+					break
+				}
 				klog.V(4).Infof("KVCacheAware.gcStaleFields: failed to read %s: %v", key, err)
 				continue
 			}
@@ -410,6 +411,10 @@ func (t *KVCacheAware) gcStaleFields() {
 		if len(staleFields) > 0 {
 			t.deleteStaleFields(staleFields)
 		}
+		if interrupted {
+			return
+		}
+		t.gcCursor = nextCursor
 		if nextCursor == 0 {
 			return
 		}
