@@ -209,10 +209,6 @@ func (s *ModelPrefixStore) Add(model string, hashes []uint64, pod *datastore.Pod
 	s.podHashesMu.Lock()
 	podLRU, exists := s.podHashes[nsName]
 	if !exists {
-		// Add runs after the proxied request completes, possibly long after the pod is
-		// gone. Re-registering it then would leave entries nothing can evict. The gate is
-		// sound because the store removes a pod before dispatching its delete event: a miss
-		// here means the purge has fired or will fire.
 		if s.store.GetPodInfo(nsName) == nil {
 			s.podHashesMu.Unlock()
 			return
@@ -261,9 +257,6 @@ func (s *ModelPrefixStore) Add(model string, hashes []uint64, pod *datastore.Pod
 		podLRU.Add(hashModelKey{hash: hash, model: model}, struct{}{})
 	}
 
-	// A deletion that ran meanwhile purged what it saw, not what we kept inserting, so
-	// take ours back out. Pointer compare, not presence: a recreated pod's new LRU is
-	// not ours, and mistaking it for ours would leave this call's entries behind.
 	s.podHashesMu.RLock()
 	current, registered := s.podHashes[nsName]
 	s.podHashesMu.RUnlock()
