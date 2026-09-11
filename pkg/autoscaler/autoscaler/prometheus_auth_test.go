@@ -263,6 +263,17 @@ func TestResolvePrometheusAuthErrors(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, prometheusAuthMaterial{}, material)
 	})
+
+	t.Run("insecureSkipVerify does not read caSecret", func(t *testing.T) {
+		noRead := func(context.Context, string, string) (*corev1.Secret, error) {
+			t.Fatal("caSecret must not be read under insecureSkipVerify")
+			return nil, nil
+		}
+		auth := &workload.PrometheusAuth{TLSConfig: &workload.PrometheusTLSConfig{InsecureSkipVerify: true, CASecret: secretKeyRef("prom-ca", "ca.crt")}}
+		material, err := resolvePrometheusAuth(context.Background(), noRead, "default", auth)
+		require.NoError(t, err)
+		assert.Equal(t, prometheusAuthMaterial{insecureSkipVerify: true}, material)
+	})
 }
 
 func TestSecretsAreReadFromThePolicyNamespace(t *testing.T) {

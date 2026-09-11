@@ -43,7 +43,7 @@ type prometheusAuthMaterial struct {
 	insecureSkipVerify bool
 }
 
-// resolvePrometheusAuth reads the Secrets referenced by auth from namespace.
+// resolvePrometheusAuth reads the Secrets referenced by auth from namespace; caSecret is not read under insecureSkipVerify, which never uses it.
 func resolvePrometheusAuth(ctx context.Context, getSecret SecretGetter, namespace string, auth *v1alpha1.PrometheusAuth) (prometheusAuthMaterial, error) {
 	var material prometheusAuthMaterial
 	if auth == nil {
@@ -58,7 +58,7 @@ func resolvePrometheusAuth(ctx context.Context, getSecret SecretGetter, namespac
 	}
 	if auth.TLSConfig != nil {
 		material.insecureSkipVerify = auth.TLSConfig.InsecureSkipVerify
-		if auth.TLSConfig.CASecret != nil {
+		if auth.TLSConfig.CASecret != nil && !auth.TLSConfig.InsecureSkipVerify {
 			ca, err := readSecretKey(ctx, getSecret, namespace, auth.TLSConfig.CASecret)
 			if err != nil {
 				return material, fmt.Errorf("caSecret: %w", err)

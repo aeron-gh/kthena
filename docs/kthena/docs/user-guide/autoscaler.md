@@ -141,7 +141,7 @@ metricSources:
 
 - **bearerTokenSecret**: Secret key whose value is sent as `Authorization: Bearer <token>`. Surrounding whitespace is trimmed, so a value stored from a file with a trailing newline still works. With an `http://` serverURL the token travels in cleartext, so prefer `https://` outside a trusted network.
 - **tlsConfig.caSecret**: Secret key holding a PEM-encoded CA bundle used to verify the server certificate. `tlsConfig` requires an `https://` serverURL.
-- **tlsConfig.insecureSkipVerify**: Disables certificate verification, which also makes `caSecret` irrelevant. For development only.
+- **tlsConfig.insecureSkipVerify**: Disables certificate verification. `caSecret` is not read in this mode, so it may be missing or unlabeled. For development only.
 
 The Secrets are read on every reconcile, so a rotated token or CA takes effect without restarting the controller. If a referenced Secret is missing or unlabeled, or its key is missing or holds an empty value, the metric is skipped for that reconcile with a warning and no scaling decision is made from it; set `optional: true` on a selector to proceed without that value instead.
 
