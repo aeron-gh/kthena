@@ -446,6 +446,9 @@ func (e *Executor) write(state *progress, result *lineResult) error {
 	switch {
 	case result.readErr != nil:
 		entry.Error = &outputError{Code: "input_unreadable", Message: result.readErr.Error()}
+	case result.response != nil && errors.Is(result.response.Err, ErrResponseTooLarge):
+		entry.Error = &outputError{Code: "response_too_large",
+			Message: fmt.Sprintf("the response is larger than %d bytes", e.config.MaxResponseBytes)}
 	case result.response == nil || result.response.Err != nil:
 		message := "the request could not be sent"
 		if result.response != nil && result.response.Err != nil {
