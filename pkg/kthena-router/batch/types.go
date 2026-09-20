@@ -76,6 +76,29 @@ func (s Status) timestampField() string {
 	}
 }
 
+// File purposes and statuses from the OpenAI files API.
+const (
+	PurposeBatch       = "batch"
+	PurposeBatchOutput = "batch_output"
+
+	FileUploaded  = "uploaded"
+	FileProcessed = "processed"
+	FileError     = "error"
+)
+
+// File is the record for an uploaded input file or a produced result file.
+type File struct {
+	ID        string
+	Tenant    string
+	Filename  string
+	Purpose   string
+	Status    string
+	Bytes     int64
+	CreatedAt int64
+	ExpiresAt int64
+	Deleted   bool
+}
+
 // Counts is the OpenAI request_counts object.
 type Counts struct {
 	Total     int64 `json:"total"`

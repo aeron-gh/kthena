@@ -609,3 +609,63 @@ func TestCorruptRecordsAreReportedNotIgnored(t *testing.T) {
 	_, err = store.GetCheckpoint(ctx, "batch_1")
 	assert.Error(t, err, "unreadable checkpoint segments must surface")
 }
+
+func TestFileRecordRoundTrip(t *testing.T) {
+	_, store := newTestStore(t)
+	ctx := context.Background()
+
+	file := &File{
+		ID:        "file-1",
+		Tenant:    "alice",
+		Filename:  "questions.jsonl",
+		Purpose:   PurposeBatch,
+		Bytes:     2048,
+		ExpiresAt: time.Now().Add(720 * time.Hour).Unix(),
+	}
+	require.NoError(t, store.CreateFile(ctx, file))
+	assert.Equal(t, FileUploaded, file.Status, "status defaults to uploaded")
+	assert.NotZero(t, file.CreatedAt)
+
+	got, err := store.GetFile(ctx, "file-1")
+	require.NoError(t, err)
+	assert.Equal(t, file.ID, got.ID)
+	assert.Equal(t, file.Tenant, got.Tenant)
+	assert.Equal(t, file.Filename, got.Filename)
+	assert.Equal(t, file.Purpose, got.Purpose)
+	assert.Equal(t, FileUploaded, got.Status)
+	assert.Equal(t, file.Bytes, got.Bytes)
+	assert.Equal(t, file.CreatedAt, got.CreatedAt)
+	assert.Equal(t, file.ExpiresAt, got.ExpiresAt)
+	assert.False(t, got.Deleted)
+
+	_, err = store.GetFile(ctx, "file-nope")
+	assert.ErrorIs(t, err, ErrNotFound)
+	assert.Error(t, store.CreateFile(ctx, &File{}))
+	assert.Error(t, store.CreateFile(ctx, nil))
+}
+
+func TestDeleteFileWaitsForTheBatchesThatNeedIt(t *testing.T) {
+	server, store := newTestStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, store.CreateFile(ctx, &File{ID: "file-free", Tenant: "alice", Purpose: PurposeBatch}))
+	require.NoError(t, store.CreateFile(ctx, &File{ID: "file-busy", Tenant: "alice", Purpose: PurposeBatch}))
+	require.NoError(t, server.client.SAdd(ctx, store.fileRefsKey("file-busy"), "batch_1").Err())
+
+	removable, err := store.DeleteFile(ctx, "file-free")
+	require.NoError(t, err)
+	assert.True(t, removable, "an unused file can go right away")
+
+	removable, err = store.DeleteFile(ctx, "file-busy")
+	require.NoError(t, err)
+	assert.False(t, removable, "a running batch still needs its input file")
+
+	for _, id := range []string{"file-free", "file-busy"} {
+		got, err := store.GetFile(ctx, id)
+		require.NoError(t, err)
+		assert.True(t, got.Deleted, "%s is marked deleted either way", id)
+	}
+
+	_, err = store.DeleteFile(ctx, "file-nope")
+	assert.ErrorIs(t, err, ErrNotFound)
+}

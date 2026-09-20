@@ -46,4 +46,11 @@ type Store interface {
 	SaveCheckpoint(ctx context.Context, lease *Lease, checkpoint *Checkpoint) error
 	// GetCheckpoint returns the progress a new owner should resume from.
 	GetCheckpoint(ctx context.Context, id string) (*Checkpoint, error)
+	// CreateFile stores the record for an uploaded or produced file.
+	CreateFile(ctx context.Context, file *File) error
+	// GetFile returns one file record, or ErrNotFound.
+	GetFile(ctx context.Context, id string) (*File, error)
+	// DeleteFile marks a file deleted and reports whether its bytes can go now,
+	// which they cannot while a batch still needs them.
+	DeleteFile(ctx context.Context, id string) (bool, error)
 }

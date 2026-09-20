@@ -370,3 +370,90 @@ func jobFromHash(raw map[string]string) (*Job, error) {
 	}
 	return job, nil
 }
+
+func (s *RedisStore) fileKey(id string) string     { return s.prefix + "file:" + id }
+func (s *RedisStore) fileRefsKey(id string) string { return s.prefix + "fileref:" + id }
+
+func (s *RedisStore) fileIndexKey(tenant string) string {
+	return s.prefix + "idx:files:" + tenant
+}
+
+// CreateFile stores a file record and indexes it for its tenant.
+func (s *RedisStore) CreateFile(ctx context.Context, file *File) error {
+	if file == nil || file.ID == "" {
+		return errors.New("batch: file id is required")
+	}
+	if file.Status == "" {
+		file.Status = FileUploaded
+	}
+	if file.CreatedAt == 0 {
+		file.CreatedAt = s.now().Unix()
+	}
+	pipe := s.client.TxPipeline()
+	pipe.HSet(ctx, s.fileKey(file.ID), file.toHash()...)
+	pipe.ZAddNX(ctx, s.fileIndexKey(file.Tenant), redis.Z{Score: float64(file.CreatedAt), Member: file.ID})
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// GetFile returns one file record.
+func (s *RedisStore) GetFile(ctx context.Context, id string) (*File, error) {
+	raw, err := s.client.HGetAll(ctx, s.fileKey(id)).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 {
+		return nil, ErrNotFound
+	}
+	return fileFromHash(raw), nil
+}
+
+// DeleteFile marks the record deleted, and says whether the bytes can be removed now.
+func (s *RedisStore) DeleteFile(ctx context.Context, id string) (bool, error) {
+	exists, err := s.client.Exists(ctx, s.fileKey(id)).Result()
+	if err != nil {
+		return false, err
+	}
+	if exists == 0 {
+		return false, ErrNotFound
+	}
+	pipe := s.client.TxPipeline()
+	pipe.HSet(ctx, s.fileKey(id), "deleted", "1")
+	refs := pipe.SCard(ctx, s.fileRefsKey(id))
+	if _, err := pipe.Exec(ctx); err != nil {
+		return false, err
+	}
+	return refs.Val() == 0, nil
+}
+
+func (f *File) toHash() []any {
+	deleted := "0"
+	if f.Deleted {
+		deleted = "1"
+	}
+	return []any{
+		"id", f.ID,
+		"tenant", f.Tenant,
+		"filename", f.Filename,
+		"purpose", f.Purpose,
+		"status", f.Status,
+		"bytes", f.Bytes,
+		"created_at", f.CreatedAt,
+		"expires_at", f.ExpiresAt,
+		"deleted", deleted,
+	}
+}
+
+func fileFromHash(raw map[string]string) *File {
+	return &File{
+		ID:        raw["id"],
+		Tenant:    raw["tenant"],
+		Filename:  raw["filename"],
+		Purpose:   raw["purpose"],
+		Status:    raw["status"],
+		Bytes:     parseInt(raw["bytes"]),
+		CreatedAt: parseInt(raw["created_at"]),
+		ExpiresAt: parseInt(raw["expires_at"]),
+		Deleted:   raw["deleted"] == "1",
+	}
+}
