@@ -111,6 +111,8 @@ func (s *Server) Run(ctx context.Context) {
 	}
 	klog.Infof("Controllers have synced, starting store periodic update loop")
 	store.Run(ctx)
+	// start the batch API before serving, so the hook is in place on the first request
+	s.startBatch(ctx, r)
 	// start router
 	s.startRouter(ctx, r, store)
 

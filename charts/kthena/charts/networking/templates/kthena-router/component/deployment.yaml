@@ -132,6 +132,36 @@ spec:
 
             - name: DRAIN_TIMEOUT
               value: {{ .Values.kthenaRouter.drainTimeout | quote }}
+            {{- if .Values.kthenaRouter.batch.enabled }}
+            - name: BATCH_ENABLED
+              value: "true"
+            - name: BATCH_WORKER_ENABLED
+              value: {{ .Values.kthenaRouter.batch.worker.enabled | quote }}
+            - name: BATCH_STORAGE_PATH
+              value: {{ .Values.kthenaRouter.batch.storage.mountPath | quote }}
+            - name: BATCH_MAX_FILE_BYTES
+              value: {{ .Values.kthenaRouter.batch.limits.maxFileBytes | quote }}
+            - name: BATCH_MAX_REQUESTS
+              value: {{ .Values.kthenaRouter.batch.limits.maxRequestsPerBatch | quote }}
+            - name: BATCH_MAX_LINE_BYTES
+              value: {{ .Values.kthenaRouter.batch.limits.maxLineBytes | quote }}
+            - name: BATCH_MAX_RESPONSE_BYTES
+              value: {{ .Values.kthenaRouter.batch.limits.maxResponseBytes | quote }}
+            - name: BATCH_MAX_CONCURRENT_JOBS
+              value: {{ .Values.kthenaRouter.batch.worker.maxConcurrentJobs | quote }}
+            - name: BATCH_CONCURRENCY
+              value: {{ .Values.kthenaRouter.batch.worker.concurrency | quote }}
+            - name: BATCH_LEASE_TTL
+              value: {{ .Values.kthenaRouter.batch.worker.leaseTTL | quote }}
+            - name: BATCH_LINE_TIMEOUT
+              value: {{ .Values.kthenaRouter.batch.worker.lineTimeout | quote }}
+            - name: BATCH_ACCESS_LOG
+              value: {{ .Values.kthenaRouter.batch.accessLog | quote }}
+            {{- with .Values.kthenaRouter.batch.forwardHeaders }}
+            - name: BATCH_FORWARD_HEADERS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- end }}
           resources: {{- toYaml .Values.kthenaRouter.resource | nindent 12 }}
           livenessProbe:
             httpGet:
@@ -165,6 +195,10 @@ spec:
             mountPath: /etc/tls
             readOnly: true
           {{- end }}
+          {{- if .Values.kthenaRouter.batch.enabled }}
+          - name: batch-storage
+            mountPath: {{ .Values.kthenaRouter.batch.storage.mountPath }}
+          {{- end }}
       volumes:
         - name: scheduler-config
           configMap:
@@ -180,7 +214,17 @@ spec:
             secretName: {{ .Values.kthenaRouter.webhook.tls.secretName }}
             optional: true
         {{- end }}
+        {{- if .Values.kthenaRouter.batch.enabled }}
+        - name: batch-storage
+          persistentVolumeClaim:
+            claimName: {{ required "kthenaRouter.batch.storage.claimName is required when batch is enabled" .Values.kthenaRouter.batch.storage.claimName }}
+        {{- end }}
       serviceAccountName: kthena-router
+      {{- if .Values.kthenaRouter.batch.enabled }}
+      securityContext:
+        fsGroup: {{ .Values.kthenaRouter.batch.storage.fsGroup }}
+        fsGroupChangePolicy: OnRootMismatch
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.kthenaRouter.terminationGracePeriodSeconds }}
       {{- with .Values.kthenaRouter.tolerations }}
       tolerations:

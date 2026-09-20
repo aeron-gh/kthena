@@ -46,6 +46,33 @@ kthenaRouter:
       memory: 128Mi
   # -- The router will drain all in-flight requests before forcefully closing connections
   terminationGracePeriodSeconds: 330
+  # batch configures the OpenAI-compatible batch API. It needs Redis and a volume
+  # shared by every kthena-router replica.
+  batch:
+    enabled: false
+    storage:
+      # claimName must be a ReadWriteMany PVC when replicas is more than one.
+      claimName: ""
+      mountPath: /var/lib/kthena/batch
+      # fsGroup must match the user in the image, which is 65532.
+      fsGroup: 65532
+    worker:
+      # Set to false to serve the batch API here but run the batches elsewhere.
+      enabled: true
+      maxConcurrentJobs: 2
+      concurrency: 8
+      leaseTTL: 30s
+      lineTimeout: 10m
+    limits:
+      maxFileBytes: 209715200
+      maxRequestsPerBatch: 50000
+      maxLineBytes: 1048576
+      maxResponseBytes: 2097152
+    # accessLog writes one access log line per batch request; turn it off for big batches.
+    accessLog: true
+    # forwardHeaders are client headers replayed on every batch request, for ModelRoutes
+    # that match on headers.
+    forwardHeaders: []
   # -- Drain timeout for kthena-router graceful shutdown.
   # -- This should be less than terminationGracePeriodSeconds.
   drainTimeout: 5m
