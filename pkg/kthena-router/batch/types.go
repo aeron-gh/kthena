@@ -99,6 +99,14 @@ type File struct {
 	Deleted   bool
 }
 
+// BatchError is one entry of the errors list on a failed batch.
+type BatchError struct {
+	Code    string `json:"code"`
+	Line    int64  `json:"line,omitempty"`
+	Message string `json:"message"`
+	Param   string `json:"param,omitempty"`
+}
+
 // Counts is the OpenAI request_counts object.
 type Counts struct {
 	Total     int64 `json:"total"`
@@ -137,6 +145,7 @@ type Job struct {
 	Metadata         map[string]string
 	Dispatch         Dispatch
 	Counts           Counts
+	Errors           []BatchError
 	Holder           string
 	Fence            int64
 	CreatedAt        int64

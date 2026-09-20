@@ -32,18 +32,34 @@ import (
 )
 
 const (
-	filesPath       = "/v1/files"
-	minExpiry       = int64(3600)
-	maxExpiry       = int64(2592000)
-	maxFormValue    = 1 << 12
-	multipartSlack  = 1 << 20
-	defaultMaxBytes = int64(200 << 20)
+	filesPath        = "/v1/files"
+	batchesPath      = "/v1/batches"
+	minExpiry        = int64(3600)
+	maxExpiry        = int64(2592000)
+	maxFormValue     = 1 << 12
+	multipartSlack   = 1 << 20
+	defaultMaxBytes  = int64(200 << 20)
+	maxCreateBody    = 1 << 20
+	defaultPageSize  = 20
+	maxPageSize      = 100
+	maxMetadata      = 16
+	maxMetadataKey   = 64
+	maxMetadataVal   = 512
+	completionWindow = "24h"
 )
 
 // Config holds the operator settings the batch API needs.
 type Config struct {
 	MaxFileBytes   int64
 	FileExpiration time.Duration
+	// Endpoints a batch may target. Empty means chat completions only.
+	Endpoints []string
+	// ForwardHeaders are the client headers replayed on every batch line, for
+	// ModelRoutes that match on headers.
+	ForwardHeaders []string
+	// GatewayContext reads the Gateway API listener a request arrived on. The
+	// router wiring supplies it, so this package never imports the router.
+	GatewayContext func(c *gin.Context) Dispatch
 }
 
 // Service serves the OpenAI files and batches endpoints from inside the router.
@@ -73,15 +89,34 @@ func newID(prefix string) string {
 
 // Handles reports whether this request belongs to the batch API.
 func (s *Service) Handles(method, path string) bool {
-	return path == filesPath || strings.HasPrefix(path, filesPath+"/")
+	return path == filesPath || strings.HasPrefix(path, filesPath+"/") ||
+		path == batchesPath || strings.HasPrefix(path, batchesPath+"/")
+}
+
+func (s *Service) supports(endpoint string) bool {
+	if len(s.config.Endpoints) == 0 {
+		return endpoint == "/v1/chat/completions"
+	}
+	for _, allowed := range s.config.Endpoints {
+		if allowed == endpoint {
+			return true
+		}
+	}
+	return false
 }
 
 // Serve routes one batch API request.
 func (s *Service) Serve(c *gin.Context) {
 	path := c.Request.URL.Path
 	method := c.Request.Method
+	if path == batchesPath || strings.HasPrefix(path, batchesPath+"/") {
+		s.serveBatches(c, method, strings.Trim(strings.TrimPrefix(path, batchesPath), "/"))
+		return
+	}
 	rest := strings.Trim(strings.TrimPrefix(path, filesPath), "/")
 	switch {
+	case rest == "" && method == http.MethodGet:
+		s.listFiles(c)
 	case rest == "" && method == http.MethodPost:
 		s.uploadFile(c)
 	case rest != "" && strings.HasSuffix(rest, "/content") && method == http.MethodGet:

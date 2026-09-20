@@ -669,3 +669,123 @@ func TestDeleteFileWaitsForTheBatchesThatNeedIt(t *testing.T) {
 	_, err = store.DeleteFile(ctx, "file-nope")
 	assert.ErrorIs(t, err, ErrNotFound)
 }
+
+func TestListJobsPagesNewestFirst(t *testing.T) {
+	_, store := newTestStore(t)
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		job := newTestJob(fmt.Sprintf("batch_%d", i), 0)
+		job.CreatedAt = int64(100 + i)
+		mustCreate(t, store, job)
+	}
+
+	first, more, err := store.ListJobs(ctx, "alice", "", 2)
+	require.NoError(t, err)
+	require.Len(t, first, 2)
+	assert.Equal(t, []string{"batch_4", "batch_3"}, []string{first[0].ID, first[1].ID}, "newest first")
+	assert.True(t, more)
+
+	second, more, err := store.ListJobs(ctx, "alice", "batch_3", 2)
+	require.NoError(t, err)
+	require.Len(t, second, 2)
+	assert.Equal(t, []string{"batch_2", "batch_1"}, []string{second[0].ID, second[1].ID}, "the cursor continues the page")
+	assert.True(t, more)
+
+	last, more, err := store.ListJobs(ctx, "alice", "batch_1", 2)
+	require.NoError(t, err)
+	require.Len(t, last, 1)
+	assert.Equal(t, "batch_0", last[0].ID)
+	assert.False(t, more, "the final page says so")
+
+	_, _, err = store.ListJobs(ctx, "alice", "batch_nope", 2)
+	assert.ErrorIs(t, err, ErrNotFound, "an unknown cursor is refused, not silently ignored")
+
+	empty, more, err := store.ListJobs(ctx, "bob", "", 10)
+	require.NoError(t, err)
+	assert.Empty(t, empty, "batches are listed per tenant")
+	assert.False(t, more)
+}
+
+func TestListFilesFiltersDeletedAndPurpose(t *testing.T) {
+	_, store := newTestStore(t)
+	ctx := context.Background()
+	for i, purpose := range []string{PurposeBatch, PurposeBatchOutput, PurposeBatch} {
+		require.NoError(t, store.CreateFile(ctx, &File{
+			ID: fmt.Sprintf("file-%d", i), Tenant: "alice", Purpose: purpose, CreatedAt: int64(100 + i),
+		}))
+	}
+	_, err := store.DeleteFile(ctx, "file-2")
+	require.NoError(t, err)
+
+	files, more, err := store.ListFiles(ctx, "alice", "", "", 10)
+	require.NoError(t, err)
+	assert.False(t, more)
+	require.Len(t, files, 2, "the deleted file is gone from the listing")
+	assert.Equal(t, []string{"file-1", "file-0"}, []string{files[0].ID, files[1].ID})
+
+	inputs, _, err := store.ListFiles(ctx, "alice", PurposeBatch, "", 10)
+	require.NoError(t, err)
+	require.Len(t, inputs, 1)
+	assert.Equal(t, "file-0", inputs[0].ID, "purpose filters the listing")
+}
+
+func TestHoldAndReleaseFile(t *testing.T) {
+	_, store := newTestStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.CreateFile(ctx, &File{ID: "file-1", Tenant: "alice", Purpose: PurposeBatch}))
+	require.NoError(t, store.HoldFile(ctx, "file-1", "batch_1"))
+
+	removable, err := store.DeleteFile(ctx, "file-1")
+	require.NoError(t, err)
+	assert.False(t, removable, "the batch still reads it")
+
+	require.NoError(t, store.ReleaseFile(ctx, "file-1", "batch_1"))
+	removable, err = store.DeleteFile(ctx, "file-1")
+	require.NoError(t, err)
+	assert.True(t, removable, "once the batch is done the bytes can go")
+}
+
+func TestJobKeepsItsValidationErrors(t *testing.T) {
+	_, store := newTestStore(t)
+	ctx := context.Background()
+	job := newTestJob("batch_1", 0)
+	job.Errors = []BatchError{
+		{Code: "invalid_json", Line: 3, Message: "line 3 is not valid JSON"},
+		{Code: "duplicate_custom_id", Line: 7, Message: "custom_id a is used twice", Param: "custom_id"},
+	}
+	mustCreate(t, store, job)
+
+	got, err := store.GetJob(ctx, "batch_1")
+	require.NoError(t, err)
+	assert.Equal(t, job.Errors, got.Errors, "the user must be able to see why their file was rejected")
+}
+
+func TestListingKeepsCreationOrderWithinOneSecond(t *testing.T) {
+	_, store := newTestStore(t)
+	ctx := context.Background()
+	second := time.Now().Unix()
+
+	// The ids sort the opposite way round to the creation order, so a listing that
+	// falls back to sorting by id gets this wrong.
+	require.NoError(t, store.CreateFile(ctx, &File{ID: "file-zz", Tenant: "alice", Purpose: PurposeBatch, CreatedAt: second}))
+	require.NoError(t, store.CreateFile(ctx, &File{ID: "file-aa", Tenant: "alice", Purpose: PurposeBatch, CreatedAt: second}))
+
+	files, _, err := store.ListFiles(ctx, "alice", "", "", 10)
+	require.NoError(t, err)
+	require.Len(t, files, 2)
+	assert.Equal(t, []string{"file-aa", "file-zz"}, []string{files[0].ID, files[1].ID},
+		"two files made in the same second still come back newest first")
+
+	jobFirst := newTestJob("batch_zz", 0)
+	jobFirst.CreatedAt = second
+	mustCreate(t, store, jobFirst)
+	jobSecond := newTestJob("batch_aa", 0)
+	jobSecond.CreatedAt = second
+	mustCreate(t, store, jobSecond)
+
+	jobs, _, err := store.ListJobs(ctx, "alice", "", 10)
+	require.NoError(t, err)
+	require.Len(t, jobs, 2)
+	assert.Equal(t, []string{"batch_aa", "batch_zz"}, []string{jobs[0].ID, jobs[1].ID},
+		"and so do two batches")
+}

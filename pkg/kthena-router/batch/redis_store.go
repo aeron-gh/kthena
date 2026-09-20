@@ -80,6 +80,12 @@ func (s *RedisStore) queueKey() string          { return s.prefix + "queue" }
 func (s *RedisStore) activeKey() string         { return s.prefix + "active" }
 func (s *RedisStore) fenceKey() string          { return s.prefix + "fence" }
 
+// indexScore orders the listing by creation time with microsecond precision, so two
+// batches created in the same second still come back in the order they were made.
+func (s *RedisStore) indexScore(createdAt int64) float64 {
+	return float64(createdAt)*1e6 + float64(s.now().UnixMicro()%1e6)
+}
+
 func (s *RedisStore) tenantIndexKey(tenant string) string {
 	return s.prefix + "idx:batches:" + tenant
 }
@@ -102,7 +108,7 @@ func (s *RedisStore) CreateJob(ctx context.Context, job *Job) error {
 	pipe := s.client.TxPipeline()
 	pipe.HSet(ctx, s.jobKey(job.ID), fields...)
 	pipe.ZAddNX(ctx, s.queueKey(), redis.Z{Score: float64(job.CreatedAt), Member: job.ID})
-	pipe.ZAddNX(ctx, s.tenantIndexKey(job.Tenant), redis.Z{Score: float64(job.CreatedAt), Member: job.ID})
+	pipe.ZAddNX(ctx, s.tenantIndexKey(job.Tenant), redis.Z{Score: s.indexScore(job.CreatedAt), Member: job.ID})
 	_, err = pipe.Exec(ctx)
 	return err
 }
@@ -303,6 +309,10 @@ func (j *Job) toHash() ([]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	failures, err := json.Marshal(j.Errors)
+	if err != nil {
+		return nil, err
+	}
 	return []any{
 		"id", j.ID,
 		"tenant", j.Tenant,
@@ -314,6 +324,7 @@ func (j *Job) toHash() ([]any, error) {
 		"completion_window", j.CompletionWindow,
 		"metadata", string(metadata),
 		"dispatch", string(dispatch),
+		"errors", string(failures),
 		"total", j.Counts.Total,
 		"completed", j.Counts.Completed,
 		"failed", j.Counts.Failed,
@@ -368,6 +379,11 @@ func jobFromHash(raw map[string]string) (*Job, error) {
 			return nil, fmt.Errorf("batch: job dispatch: %w", err)
 		}
 	}
+	if failures := raw["errors"]; failures != "" && failures != "null" {
+		if err := json.Unmarshal([]byte(failures), &job.Errors); err != nil {
+			return nil, fmt.Errorf("batch: job errors: %w", err)
+		}
+	}
 	return job, nil
 }
 
@@ -391,7 +407,7 @@ func (s *RedisStore) CreateFile(ctx context.Context, file *File) error {
 	}
 	pipe := s.client.TxPipeline()
 	pipe.HSet(ctx, s.fileKey(file.ID), file.toHash()...)
-	pipe.ZAddNX(ctx, s.fileIndexKey(file.Tenant), redis.Z{Score: float64(file.CreatedAt), Member: file.ID})
+	pipe.ZAddNX(ctx, s.fileIndexKey(file.Tenant), redis.Z{Score: s.indexScore(file.CreatedAt), Member: file.ID})
 	_, err := pipe.Exec(ctx)
 	return err
 }
@@ -456,4 +472,81 @@ func fileFromHash(raw map[string]string) *File {
 		ExpiresAt: parseInt(raw["expires_at"]),
 		Deleted:   raw["deleted"] == "1",
 	}
+}
+
+// page reads one page of ids from a tenant index, newest first, starting after the
+// cursor id. It returns the ids and whether more follow.
+func (s *RedisStore) page(ctx context.Context, indexKey, after string, limit int) ([]string, bool, error) {
+	start := int64(0)
+	if after != "" {
+		rank, err := s.client.ZRevRank(ctx, indexKey, after).Result()
+		if errors.Is(err, redis.Nil) {
+			return nil, false, ErrNotFound
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		start = rank + 1
+	}
+	ids, err := s.client.ZRevRange(ctx, indexKey, start, start+int64(limit)).Result()
+	if err != nil {
+		return nil, false, err
+	}
+	if len(ids) > limit {
+		return ids[:limit], true, nil
+	}
+	return ids, false, nil
+}
+
+// ListJobs returns one page of a tenant's batches, newest first.
+func (s *RedisStore) ListJobs(ctx context.Context, tenant, after string, limit int) ([]*Job, bool, error) {
+	ids, more, err := s.page(ctx, s.tenantIndexKey(tenant), after, limit)
+	if err != nil {
+		return nil, false, err
+	}
+	jobs := make([]*Job, 0, len(ids))
+	for _, id := range ids {
+		job, err := s.GetJob(ctx, id)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, more, nil
+}
+
+// ListFiles returns one page of a tenant's files, newest first, skipping deleted ones.
+func (s *RedisStore) ListFiles(ctx context.Context, tenant, purpose, after string, limit int) ([]*File, bool, error) {
+	ids, more, err := s.page(ctx, s.fileIndexKey(tenant), after, limit)
+	if err != nil {
+		return nil, false, err
+	}
+	files := make([]*File, 0, len(ids))
+	for _, id := range ids {
+		file, err := s.GetFile(ctx, id)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		if file.Deleted || (purpose != "" && file.Purpose != purpose) {
+			continue
+		}
+		files = append(files, file)
+	}
+	return files, more, nil
+}
+
+// HoldFile records that a batch still reads this file.
+func (s *RedisStore) HoldFile(ctx context.Context, fileID, batchID string) error {
+	return s.client.SAdd(ctx, s.fileRefsKey(fileID), batchID).Err()
+}
+
+// ReleaseFile drops the claim a finished batch had on a file.
+func (s *RedisStore) ReleaseFile(ctx context.Context, fileID, batchID string) error {
+	return s.client.SRem(ctx, s.fileRefsKey(fileID), batchID).Err()
 }

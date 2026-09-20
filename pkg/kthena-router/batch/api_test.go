@@ -397,10 +397,13 @@ func TestUnknownSubpathsAreRefused(t *testing.T) {
 	api := newTestAPI(t)
 	id := mustUpload(t, api, "alice", "line\n")
 
-	for _, path := range []string{filesPath + "/", filesPath + "/" + id + "/content/extra", filesPath + "/" + id + "/unknown"} {
+	for _, path := range []string{filesPath + "/" + id + "/content/extra", filesPath + "/" + id + "/unknown"} {
 		rec := api.call(t, "alice", httptest.NewRequest(http.MethodGet, path, nil))
 		assert.Equal(t, http.StatusNotFound, rec.Code, "%s must not be served", path)
 	}
+
+	rec := api.call(t, "alice", httptest.NewRequest(http.MethodGet, filesPath+"/", nil))
+	assert.Equal(t, http.StatusOK, rec.Code, "a trailing slash still means the collection")
 }
 
 func TestDeleteWorksWhenTheBytesAreAlreadyGone(t *testing.T) {

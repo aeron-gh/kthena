@@ -53,4 +53,14 @@ type Store interface {
 	// DeleteFile marks a file deleted and reports whether its bytes can go now,
 	// which they cannot while a batch still needs them.
 	DeleteFile(ctx context.Context, id string) (bool, error)
+	// ListJobs returns one page of a tenant's batches, newest first, and whether
+	// more follow.
+	ListJobs(ctx context.Context, tenant, after string, limit int) ([]*Job, bool, error)
+	// ListFiles returns one page of a tenant's files, newest first, optionally
+	// filtered by purpose.
+	ListFiles(ctx context.Context, tenant, purpose, after string, limit int) ([]*File, bool, error)
+	// HoldFile records that a batch needs this file, so a delete keeps the bytes.
+	HoldFile(ctx context.Context, fileID, batchID string) error
+	// ReleaseFile drops that claim once the batch no longer reads the file.
+	ReleaseFile(ctx context.Context, fileID, batchID string) error
 }
