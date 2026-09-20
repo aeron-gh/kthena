@@ -96,6 +96,10 @@ var EnableFairnessScheduling = getEnvBool("ENABLE_FAIRNESS_SCHEDULING", false)
 var EnableSessionBoost = getEnvBool("ENABLE_SESSION_BOOST", false)
 
 type Router struct {
+	// apiExtension serves extra OpenAI endpoints, such as the batch API. It is nil
+	// unless that feature is enabled.
+	apiExtension APIExtension
+
 	scheduler       scheduler.Scheduler
 	authenticator   *auth.JWTAuthenticator
 	store           datastore.Store
@@ -271,6 +275,22 @@ func (r *Router) calculateRequestPriority(userID, modelName string) float64 {
 	return priority
 }
 
+// APIExtension handles OpenAI endpoints that are not model requests.
+type APIExtension interface {
+	Handles(method, path string) bool
+	Serve(c *gin.Context)
+}
+
+// SetAPIExtension installs an extension. Call it before the listeners start.
+func (r *Router) SetAPIExtension(extension APIExtension) {
+	r.apiExtension = extension
+}
+
+// APIExtension returns the installed extension, or nil when there is none.
+func (r *Router) APIExtension() APIExtension {
+	return r.apiExtension
+}
+
 type ModelRequest map[string]interface{}
 
 func (r *Router) HandlerFunc() gin.HandlerFunc {
@@ -282,6 +302,13 @@ func (r *Router) HandlerFunc() gin.HandlerFunc {
 		if c.Request.Method == http.MethodGet &&
 			(c.Request.URL.Path == "/v1/models" || c.Request.URL.Path == "/models") {
 			r.ListModels(c)
+			return
+		}
+
+		// Extensions only serve /v1/ paths, which are the ones the auth middleware covers.
+		if r.apiExtension != nil && strings.HasPrefix(c.Request.URL.Path, "/v1/") &&
+			r.apiExtension.Handles(c.Request.Method, c.Request.URL.Path) {
+			r.apiExtension.Serve(c)
 			return
 		}
 
