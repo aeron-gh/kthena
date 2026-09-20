@@ -39,6 +39,7 @@ const (
 	defaultCheckpointEvery = 200
 	defaultCheckpointAfter = 5 * time.Second
 	defaultMaxResponse     = int64(2 << 20)
+	shutdownSaveTimeout    = 10 * time.Second
 )
 
 // Request is one line of the input file, ready to send to a model.
@@ -527,7 +528,11 @@ func (e *Executor) checkpoint(ctx context.Context, lease *Lease, state *progress
 		return err
 	}
 	state.checkpoint.Done = state.done
-	return e.store.SaveCheckpoint(ctx, lease, state.checkpoint)
+	// Saving runs on a context that shutdown cannot cancel: the answers are already
+	// paid for, and losing the record of them means paying for them twice.
+	saveCtx, done := context.WithTimeout(context.WithoutCancel(ctx), shutdownSaveTimeout)
+	defer done()
+	return e.store.SaveCheckpoint(saveCtx, lease, state.checkpoint)
 }
 
 // finish writes the result files and moves the batch to its terminal status.

@@ -40,6 +40,8 @@ type Store interface {
 	// Cancel cancels a queued batch outright and asks a running one to stop. It
 	// returns the status the batch ended up in.
 	Cancel(ctx context.Context, id string) (Status, error)
+	// Release hands an unfinished batch back to the queue on shutdown.
+	Release(ctx context.Context, lease *Lease) error
 	// Reap requeues batches whose owner died and forgets finished ones.
 	Reap(ctx context.Context, limit int) (int, error)
 	// SaveCheckpoint records progress; only the current owner may write one.

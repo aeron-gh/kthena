@@ -19,6 +19,7 @@ package batch
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +33,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func binaryPutUint64(buffer []byte, value uint64) {
+	binary.LittleEndian.PutUint64(buffer, value)
+}
 
 func redisZ(score float64, member string) redis.Z {
 	return redis.Z{Score: score, Member: member}
@@ -536,4 +541,101 @@ func TestExecutorNoticesACancelThatArrivesAtTheVeryEnd(t *testing.T) {
 	assert.NotZero(t, job.CancelledAt)
 	assert.Equal(t, int64(requests), job.Counts.Completed, "every answer that was paid for is kept")
 	assert.Len(t, f.results(t, job.OutputFileID), requests)
+}
+
+func TestExecutorSavesItsProgressOnShutdown(t *testing.T) {
+	const requests = 8
+	f := newExecFixture(t, requests, ExecConfig{Concurrency: 1, CheckpointEvery: 1000})
+	ctx, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
+
+	// Nothing is checkpointed during the run, so the only save is the one on the way out.
+	f.dispatcher.onCall = func(call int64) {
+		if call == 3 {
+			shutdown()
+		}
+	}
+	lease := f.claim(t, "router-0")
+	err := f.exec.Run(ctx, lease)
+	if err != nil {
+		require.ErrorIs(t, err, context.Canceled)
+	}
+
+	checkpoint, err := f.store.GetCheckpoint(context.Background(), "batch_1")
+	require.NoError(t, err, "the work done before the pod died must be recorded")
+	done := checkpoint.Counts.Completed + checkpoint.Counts.Failed
+	assert.Greater(t, done, int64(0), "answers already paid for must survive a restart")
+	assert.Less(t, done, int64(requests))
+	assert.NotEmpty(t, checkpoint.Segments)
+}
+
+func TestExecutorIgnoresBytesWrittenAfterTheCheckpoint(t *testing.T) {
+	const requests = 3
+	f := newExecFixture(t, requests, ExecConfig{Concurrency: 1, CheckpointEvery: 1000})
+	ctx := context.Background()
+
+	// Build the state a pod leaves behind when it is killed between writing an answer
+	// and recording it: the segment holds three answers, the checkpoint knows two.
+	lease := f.claim(t, "router-0")
+	require.NoError(t, f.store.Transition(ctx, lease, StatusValidating, StatusInProgress,
+		map[string]string{"total": fmt.Sprint(requests)}))
+	index := make([]byte, 0, requests*indexEntryBytes)
+	offset := 0
+	var content strings.Builder
+	for i := 0; i < requests; i++ {
+		line := batchLine(fmt.Sprintf("req-%03d", i)) + "\n"
+		entry := make([]byte, indexEntryBytes)
+		binaryPutUint64(entry, uint64(offset))
+		index = append(index, entry...)
+		content.WriteString(line)
+		offset += len(line)
+	}
+	_, err := f.files.Create(ctx, "alice", indexID("batch_1"), strings.NewReader(string(index)), 0)
+	require.NoError(t, err)
+
+	segment := "batch_1-out-0-stale"
+	var written int64
+	var validBytes int64
+	file, err := f.files.Append(ctx, "alice", segment)
+	require.NoError(t, err)
+	for i := 0; i < requests; i++ {
+		entry := fmt.Sprintf(`{"id":"old-%d","custom_id":"req-%03d","response":{"status_code":200,`+
+			`"request_id":"old-%d","body":{"stale":true}},"error":null}`+"\n", i, i, i)
+		n, err := file.WriteString(entry)
+		require.NoError(t, err)
+		written += int64(n)
+		if i < 2 {
+			validBytes = written
+		}
+	}
+	require.NoError(t, file.Close())
+
+	done := []byte{0b00000011}
+	require.NoError(t, f.store.SaveCheckpoint(ctx, lease, &Checkpoint{
+		Segments: []Segment{{Name: segment, ValidBytes: validBytes}},
+		Done:     done,
+		Counts:   Counts{Total: requests, Completed: 2},
+	}))
+
+	f.server.fastForward(t, testLeaseTTL+time.Second)
+	_, err = f.store.Reap(ctx, 100)
+	require.NoError(t, err)
+	next := f.claim(t, "router-1")
+	require.NoError(t, f.exec.Run(ctx, next))
+
+	job, err := f.store.GetJob(ctx, "batch_1")
+	require.NoError(t, err)
+	assert.Equal(t, StatusCompleted, job.Status)
+
+	lines := f.results(t, job.OutputFileID)
+	require.Len(t, lines, requests, "the third answer written past the checkpoint must not be copied twice")
+	seen := map[string]int{}
+	for _, line := range lines {
+		seen[line.CustomID]++
+	}
+	for i := 0; i < requests; i++ {
+		assert.Equal(t, 1, seen[fmt.Sprintf("req-%03d", i)], "req-%03d appears exactly once", i)
+	}
+	assert.Equal(t, []string{"req-002"}, f.dispatcher.dispatched(),
+		"only the request the checkpoint did not cover is run again")
 }

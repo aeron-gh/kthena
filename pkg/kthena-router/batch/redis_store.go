@@ -43,6 +43,7 @@ var (
 	transitionScript = mustLoadScript("transition.lua")
 	reapScript       = mustLoadScript("reap.lua")
 	cancelScript     = mustLoadScript("cancel.lua")
+	releaseScript    = mustLoadScript("release.lua")
 	checkpointScript = mustLoadScript("checkpoint.lua")
 )
 
@@ -217,6 +218,16 @@ func (s *RedisStore) Cancel(ctx context.Context, id string) (Status, error) {
 		return "", ErrNotFound
 	}
 	return Status(res), nil
+}
+
+// Release gives up a batch this replica is no longer running, so another replica can
+// pick it up at once instead of waiting for the lease to expire.
+func (s *RedisStore) Release(ctx context.Context, lease *Lease) error {
+	if lease == nil {
+		return nil
+	}
+	keys := []string{s.leaseKey(lease.JobID), s.queueKey(), s.activeKey(), s.jobKey(lease.JobID)}
+	return releaseScript.Run(ctx, s.client, keys, lease.value(), lease.JobID).Err()
 }
 
 // Reap requeues batches whose owner died.
