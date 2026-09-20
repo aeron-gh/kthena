@@ -51,6 +51,8 @@ type FileStore interface {
 	Open(ctx context.Context, tenant, id string) (*os.File, error)
 	// Size returns the byte count of a stored file, or ErrNotFound.
 	Size(ctx context.Context, tenant, id string) (int64, error)
+	// Append opens a result segment for writing, creating it when it is new.
+	Append(ctx context.Context, tenant, id string) (*os.File, error)
 	// Remove deletes the bytes, or returns ErrNotFound.
 	Remove(ctx context.Context, tenant, id string) error
 	// Probe checks at startup that the volume is really writable by this pod.
@@ -143,6 +145,19 @@ func (s *FSStore) Open(ctx context.Context, tenant, id string) (*os.File, error)
 		return nil, ErrNotFound
 	}
 	return f, err
+}
+
+// Append opens a result segment for writing. Each ownership attempt writes its own
+// segment, so a stale owner can only ever append past the bytes that already count.
+func (s *FSStore) Append(ctx context.Context, tenant, id string) (*os.File, error) {
+	path, err := s.path(tenant, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), dirMode); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, fileMode)
 }
 
 // Size reports how many bytes are stored.

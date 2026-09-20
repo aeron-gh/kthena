@@ -242,6 +242,9 @@ func (s *RedisStore) SaveCheckpoint(ctx context.Context, lease *Lease, checkpoin
 	}
 	args := []any{
 		strconv.FormatInt(lease.Fence, 10),
+		strconv.FormatInt(checkpoint.Counts.Total, 10),
+		strconv.FormatInt(checkpoint.Counts.Completed, 10),
+		strconv.FormatInt(checkpoint.Counts.Failed, 10),
 		"segments", string(segments),
 		"done", string(checkpoint.Done),
 		"total", strconv.FormatInt(checkpoint.Counts.Total, 10),
