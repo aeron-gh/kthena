@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -182,8 +183,73 @@ func TestFileStoreWritesGroupReadableFiles(t *testing.T) {
 	require.NoError(t, err)
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(fileMode), info.Mode().Perm(),
-		"the volume is shared by replicas running as the same group")
+	assert.Equal(t, os.FileMode(0o640), info.Mode().Perm(),
+		"replicas share the volume by group, and nobody else may read prompts")
+
+	dir, err := os.Stat(filepath.Dir(path))
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o750), dir.Mode().Perm())
+}
+
+// slowReader hands out its data in small pieces, so a rewrite takes long enough for a
+// reader to catch it in the act.
+type slowReader struct {
+	data []byte
+	at   int
+}
+
+func (r *slowReader) Read(p []byte) (int, error) {
+	if r.at >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p[:min(len(p), 4096)], r.data[r.at:])
+	r.at += n
+	time.Sleep(time.Millisecond)
+	return n, nil
+}
+
+func TestFileStoreReplaceIsNeverSeenHalfWritten(t *testing.T) {
+	store, _ := newTestFileStore(t)
+	ctx := context.Background()
+	const size = 256 << 10
+	first := bytes.Repeat([]byte("A"), size)
+	second := bytes.Repeat([]byte("B"), size)
+
+	_, err := store.Create(ctx, "alice", "file-1", bytes.NewReader(first), 1<<20)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := store.Create(ctx, "alice", "file-1", &slowReader{data: second}, 1<<20)
+		assert.NoError(t, err)
+	}()
+
+	reads := 0
+	for running := true; running; {
+		select {
+		case <-done:
+			running = false
+		default:
+		}
+		f, err := store.Open(ctx, "alice", "file-1")
+		require.NoError(t, err, "the file must never disappear during a rewrite")
+		data, err := io.ReadAll(f)
+		f.Close()
+		require.NoError(t, err)
+		reads++
+		if !bytes.Equal(data, first) && !bytes.Equal(data, second) {
+			t.Fatalf("read %d bytes that are neither the old nor the new content", len(data))
+		}
+	}
+	assert.Greater(t, reads, 1, "the reader must have looked while the writer was working")
+
+	f, err := store.Open(ctx, "alice", "file-1")
+	require.NoError(t, err)
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	require.NoError(t, err)
+	assert.True(t, bytes.Equal(data, second), "the rewrite finished")
 }
 
 func TestFileStoreProbe(t *testing.T) {

@@ -355,3 +355,74 @@ func (zeroLines) Read(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+func TestFileContentServesRanges(t *testing.T) {
+	api := newTestAPI(t)
+	id := mustUpload(t, api, "alice", "0123456789")
+
+	req := httptest.NewRequest(http.MethodGet, filesPath+"/"+id+"/content", nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rec := api.call(t, "alice", req)
+	assert.Equal(t, http.StatusPartialContent, rec.Code, "large result files are fetched in ranges")
+	assert.Equal(t, "2345", rec.Body.String())
+	assert.Equal(t, "bytes 2-5/10", rec.Header().Get("Content-Range"))
+
+	rec = api.call(t, "alice", httptest.NewRequest(http.MethodGet, filesPath+"/"+id+"/content", nil))
+	assert.Equal(t, "application/jsonl", rec.Header().Get("Content-Type"))
+}
+
+func TestUploadAcceptsAnEmptyFile(t *testing.T) {
+	api := newTestAPI(t)
+	rec := api.call(t, "alice", uploadRequest(t, "", true, map[string]string{
+		"purpose": PurposeBatch, "filename": "empty.jsonl", "empty": "1",
+	}))
+	require.Equal(t, http.StatusBadRequest, rec.Code, "a request with no file part is still refused")
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	require.NoError(t, writer.WriteField("purpose", PurposeBatch))
+	_, err := writer.CreateFormFile("file", "empty.jsonl")
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	req := httptest.NewRequest(http.MethodPost, filesPath, &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	rec = api.call(t, "alice", req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, float64(0), decode(t, rec)["bytes"],
+		"an empty file uploads fine; the batch that uses it fails validation later")
+}
+
+func TestUnknownSubpathsAreRefused(t *testing.T) {
+	api := newTestAPI(t)
+	id := mustUpload(t, api, "alice", "line\n")
+
+	for _, path := range []string{filesPath + "/", filesPath + "/" + id + "/content/extra", filesPath + "/" + id + "/unknown"} {
+		rec := api.call(t, "alice", httptest.NewRequest(http.MethodGet, path, nil))
+		assert.Equal(t, http.StatusNotFound, rec.Code, "%s must not be served", path)
+	}
+}
+
+func TestDeleteWorksWhenTheBytesAreAlreadyGone(t *testing.T) {
+	api := newTestAPI(t)
+	id := mustUpload(t, api, "alice", "line\n")
+	require.NoError(t, api.files.Remove(context.Background(), "alice", id))
+
+	rec := api.call(t, "alice", httptest.NewRequest(http.MethodDelete, filesPath+"/"+id, nil))
+	assert.Equal(t, http.StatusOK, rec.Code, "a half-deleted file must still delete cleanly")
+	assert.Equal(t, true, decode(t, rec)["deleted"])
+}
+
+func TestWithAuthDisabledEveryoneIsOneTenant(t *testing.T) {
+	api := newTestAPI(t)
+	rec := api.call(t, "", uploadRequest(t, "line\n", true,
+		map[string]string{"purpose": PurposeBatch, "filename": "q.jsonl"}))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	id := decode(t, rec)["id"].(string)
+
+	rec = api.call(t, "", httptest.NewRequest(http.MethodGet, filesPath+"/"+id, nil))
+	assert.Equal(t, http.StatusOK, rec.Code, "without JWT auth there is a single tenant; document it")
+
+	rec = api.call(t, "alice", httptest.NewRequest(http.MethodGet, filesPath+"/"+id, nil))
+	assert.Equal(t, http.StatusNotFound, rec.Code, "a named tenant still cannot read the anonymous one")
+}
