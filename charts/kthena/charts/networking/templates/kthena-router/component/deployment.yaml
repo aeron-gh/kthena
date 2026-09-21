@@ -133,6 +133,11 @@ spec:
             - name: DRAIN_TIMEOUT
               value: {{ .Values.kthenaRouter.drainTimeout | quote }}
             {{- if .Values.kthenaRouter.batch.enabled }}
+            # POD_NAME names the batch worker, so a stuck lease points at a pod.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: BATCH_ENABLED
               value: "true"
             - name: BATCH_WORKER_ENABLED
@@ -140,17 +145,17 @@ spec:
             - name: BATCH_STORAGE_PATH
               value: {{ .Values.kthenaRouter.batch.storage.mountPath | quote }}
             - name: BATCH_MAX_FILE_BYTES
-              value: {{ .Values.kthenaRouter.batch.limits.maxFileBytes | quote }}
+              value: {{ printf "%d" (int64 .Values.kthenaRouter.batch.limits.maxFileBytes) | quote }}
             - name: BATCH_MAX_REQUESTS
-              value: {{ .Values.kthenaRouter.batch.limits.maxRequestsPerBatch | quote }}
+              value: {{ printf "%d" (int64 .Values.kthenaRouter.batch.limits.maxRequestsPerBatch) | quote }}
             - name: BATCH_MAX_LINE_BYTES
-              value: {{ .Values.kthenaRouter.batch.limits.maxLineBytes | quote }}
+              value: {{ printf "%d" (int64 .Values.kthenaRouter.batch.limits.maxLineBytes) | quote }}
             - name: BATCH_MAX_RESPONSE_BYTES
-              value: {{ .Values.kthenaRouter.batch.limits.maxResponseBytes | quote }}
+              value: {{ printf "%d" (int64 .Values.kthenaRouter.batch.limits.maxResponseBytes) | quote }}
             - name: BATCH_MAX_CONCURRENT_JOBS
-              value: {{ .Values.kthenaRouter.batch.worker.maxConcurrentJobs | quote }}
+              value: {{ printf "%d" (int64 .Values.kthenaRouter.batch.worker.maxConcurrentJobs) | quote }}
             - name: BATCH_CONCURRENCY
-              value: {{ .Values.kthenaRouter.batch.worker.concurrency | quote }}
+              value: {{ printf "%d" (int64 .Values.kthenaRouter.batch.worker.concurrency) | quote }}
             - name: BATCH_LEASE_TTL
               value: {{ .Values.kthenaRouter.batch.worker.leaseTTL | quote }}
             - name: BATCH_LINE_TIMEOUT

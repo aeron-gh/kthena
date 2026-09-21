@@ -639,3 +639,27 @@ func TestExecutorIgnoresBytesWrittenAfterTheCheckpoint(t *testing.T) {
 	assert.Equal(t, []string{"req-002"}, f.dispatcher.dispatched(),
 		"only the request the checkpoint did not cover is run again")
 }
+
+func TestExecutorNoticesADeadlineThatMovesWhileItRuns(t *testing.T) {
+	const requests = 10
+	f := newExecFixture(t, requests, ExecConfig{Concurrency: 1, CheckpointEvery: 1})
+	ctx := context.Background()
+
+	// The deadline is edited after the run has started, so a worker that trusts the
+	// snapshot it began with would keep going past it.
+	f.dispatcher.onCall = func(call int64) {
+		if call == 3 {
+			require.NoError(t, f.server.client.HSet(ctx, f.store.jobKey("batch_1"), "expires_at", 1).Err())
+		}
+	}
+	require.NoError(t, f.exec.Run(ctx, f.claim(t, "router-0")))
+
+	job, err := f.store.GetJob(ctx, "batch_1")
+	require.NoError(t, err)
+	assert.Equal(t, StatusExpired, job.Status, "the batch must stop at its deadline")
+	assert.Greater(t, job.Counts.Completed, int64(0), "the answers already paid for are kept")
+	assert.Equal(t, int64(requests), job.Counts.Completed+job.Counts.Failed)
+	failures := f.results(t, job.ErrorFileID)
+	require.NotEmpty(t, failures)
+	assert.Equal(t, "batch_expired", failures[0].Error.Code)
+}

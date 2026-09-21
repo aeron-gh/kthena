@@ -303,15 +303,17 @@ func drain(results <-chan *lineResult) {
 
 // shouldStop asks Redis whether the user cancelled the batch or its deadline passed.
 func (e *Executor) shouldStop(ctx context.Context, job *Job) outcome {
-	if job.ExpiresAt > 0 && e.now().Unix() > job.ExpiresAt {
-		return outcomeExpired
-	}
+	// Read the record rather than the snapshot this run started with, so both the
+	// deadline and a cancel are seen as they are now.
 	current, err := e.store.GetJob(ctx, job.ID)
 	if err != nil {
-		return outcomeDone
+		current = job
 	}
 	if current.Status == StatusCancelling || current.Status == StatusCancelled {
 		return outcomeCancelled
+	}
+	if current.ExpiresAt > 0 && e.now().Unix() > current.ExpiresAt {
+		return outcomeExpired
 	}
 	return outcomeDone
 }
