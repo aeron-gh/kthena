@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -193,12 +194,13 @@ func TestBatchRefusesToStartWithoutRedis(t *testing.T) {
 		"half-started is worse than off: batch needs Redis, so without it the endpoints stay away")
 }
 
-// withTestRedis points the router at a real Redis, because the startup checks talk to it.
+// withTestRedis points the router at a Redis the startup checks can reach: miniredis by
+// default, so these tests run anywhere, or a real one when KTHENA_TEST_REDIS_ADDR is set.
 func withTestRedis(t *testing.T) {
 	t.Helper()
 	addr := os.Getenv("KTHENA_TEST_REDIS_ADDR")
 	if addr == "" {
-		t.Skip("set KTHENA_TEST_REDIS_ADDR to a running Redis to run this")
+		addr = miniredis.RunT(t).Addr()
 	}
 	host, port, err := net.SplitHostPort(addr)
 	require.NoError(t, err)
@@ -207,8 +209,10 @@ func withTestRedis(t *testing.T) {
 }
 
 func TestBatchRefusesToStartWithoutWritableStorage(t *testing.T) {
+	// Redis is reachable here, so the volume is the only thing that can refuse.
 	withTestRedis(t)
 	t.Setenv("BATCH_ENABLED", "true")
+	t.Setenv("BATCH_WORKER_ENABLED", "false")
 	t.Setenv("BATCH_STORAGE_PATH", "/proc/kthena-batch-cannot-write-here")
 
 	server := &Server{}

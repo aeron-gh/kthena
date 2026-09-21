@@ -134,14 +134,16 @@ func (s *Server) startBatch(ctx context.Context, gwRouter *router.Router) {
 	if !options.enabled {
 		return
 	}
-	redisClient := utils.TryGetRedisClient()
-	if redisClient == nil {
-		klog.Errorf("Batch API is enabled but Redis is unreachable; batch stays disabled")
-		return
-	}
+	// The volume is checked first: it is a local check, and it fails the same way with
+	// or without Redis, which keeps the check itself testable anywhere.
 	files := batch.NewFSStore(options.root)
 	if err := files.Probe(ctx); err != nil {
 		klog.Errorf("Batch API is enabled but %s is not usable: %v; batch stays disabled", options.root, err)
+		return
+	}
+	redisClient := utils.TryGetRedisClient()
+	if redisClient == nil {
+		klog.Errorf("Batch API is enabled but Redis is unreachable; batch stays disabled")
 		return
 	}
 
