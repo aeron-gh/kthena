@@ -147,9 +147,10 @@ middle does not lose their progress.
 ##### Story 2: batch that yields to interactive traffic
 
 A platform team wants to soak up spare GPU capacity overnight without risking daytime
-latency. They enable the batch worker on two of six router replicas and cap per-job
-concurrency. Batch load lands on those replicas, and the interactive p99 on the others is
-unaffected.
+latency. They run two router pools: the interactive one with `worker.enabled: false`, and
+a smaller one with the worker on and per-job concurrency capped. Both pools serve the API
+and share one Redis and one volume, so a batch created against either is executed only by
+the worker pool, and the interactive p99 on the main pool is unaffected.
 
 ##### Story 3: a batch that must stop
 
@@ -170,8 +171,9 @@ file, and every request that never ran is written to the error file with
   pod wrote. A single-node test cluster gets away with ReadWriteOnce; a real cluster does
   not. The router probes the volume at startup and fails fast if it is not writable.
 - **Batch cost lands on the replica running the job.** This is why the worker has a
-  separate switch from the API: operators can serve the API everywhere and run batches
-  only where they want the load.
+  separate switch from the API: operators can serve the API from every pool and run
+  batches only in the pool they want to carry the load. The switch is per Deployment, so
+  a split means a second release of the chart, not a subset of one Deployment's replicas.
 - **Streaming is off for batch lines.** A batch result is a complete response body.
 - **First phase is `/v1/chat/completions` only.** `/v1/completions` and `/v1/embeddings`
   are the same mechanism and are the obvious next endpoints, but each needs its own
@@ -181,11 +183,12 @@ file, and every request that never ran is written to the error file with
 
 | Risk | Mitigation |
 | --- | --- |
-| Batch traffic degrades interactive latency | Worker is opt-in per replica; per-job and per-replica concurrency caps; adaptive back-off against backend load (phased, see [Flow control](#flow-control)) |
+| Batch traffic degrades interactive latency | Worker is opt-in per router pool; per-job and per-replica concurrency caps; adaptive back-off against backend load (phased, see [Flow control](#flow-control)) |
 | A partitioned owner keeps writing after takeover | Fence token on every state write; segment files scoped per ownership attempt, so a stale writer cannot corrupt the new owner's output |
 | A large file exhausts router memory | Input streamed line by line, results appended as they complete; measured 15–40 MiB at 50,000 requests against the chart's 512Mi limit |
 | Redis loses batch state | Document AOF or RDB persistence and `maxmemory-policy noeviction` as a requirement when batch is enabled |
-| Forged batch identity | Owner and gateway context travel in the request context, never in a header, so no client can spoof them |
+| Forged batch identity | Owner and gateway context travel in the request context, never in a header; the engine that trusts them binds no listener, and a client cannot write into a Go `context.Context` |
+| One tenant starves the queue | Not yet addressed: the queue is FIFO with no per-tenant bound. `maxQueuedBatchesPerTenant` and `maxActiveBatchesPerTenant` are proposed in [Configuration](#configuration) |
 | Abandoned files fill the volume | Files carry an expiry; a batch holds a reference on its input so a delete keeps the bytes until the batch is done; reap drops finished jobs |
 
 ### Design Details
@@ -318,12 +321,40 @@ This is the core design decision and the reason batch lines get everything inter
 requests get: the same route matching, the same rate limits, the same fairness queue, the
 same KV-cache aware scheduling, the same access log.
 
+##### Where a line enters the chain
+
+Not through the network-facing engine. A `/v1` request from a client passes
+`AccessLogMiddleware` and then `AuthMiddleware`, and it is `AuthMiddleware` that sets
+`common.UserIdKey` from the verified token. Per-user rate limiting and the fairness queue
+read that key, so a line that skipped it would run as an empty user and the paragraph
+above would not be true.
+
+The worker therefore dispatches into a second gin engine, assembled in process and never
+bound to a listener:
+
+```
+recovery -> batchIdentity -> [access log] -> Router.HandlerFunc()
+```
+
+`batchIdentity` stands in for `AuthMiddleware`. It reads the identity from the Go request
+context, aborts with 403 when there is none, and sets `common.UserIdKey` and, in Gateway
+API mode, the listener keys: the same gin context state the authenticated path would have
+produced. From that point on the request is handled by the ordinary chain, so route
+matching, rate limiting, fairness, KV-cache aware scheduling and the access log all behave
+as they do for a user request.
+
+This is also why the identity travels in the context rather than a header. A client cannot
+write a value into a Go `context.Context`; the only writer is the dispatcher, in the same
+process, and the engine that trusts it accepts no connections. The real `AuthMiddleware` is
+left untouched, so nothing reachable from the network is taught to trust a context-carried
+identity.
+
 Two details matter:
 
-- **Identity travels in the context, not a header.** The owning tenant and, under Gateway
-  API, the listener the batch arrived on, are captured at create time and replayed on
-  every line through `context.WithValue`. Nothing a client can set reaches the identity,
-  so a batch cannot impersonate another tenant.
+- **Identity is captured once, not per line.** The owning tenant and, under Gateway API,
+  the listener the batch arrived on, are recorded when the batch is created and replayed
+  on every line through `context.WithValue`, so a batch keeps the identity it was created
+  with even when another replica takes it over.
 - **The response writer has to look like a real connection.** `batchWriter` collects the
   body up to a cap and implements `Flush` and `CloseNotify`, because gin's streaming path
   casts the writer to `http.CloseNotifier` and a writer without it panics. Its notify
@@ -348,9 +379,9 @@ implementation to update.
 
 #### Flow control
 
-Implemented today: a per-replica cap on concurrently running batches
+Implemented today: a cap on concurrently running batches per replica
 (`maxConcurrentJobs`) and a per-batch cap on in-flight lines (`concurrency`), plus the
-per-replica worker switch.
+per-pool worker switch.
 
 Proposed next, and **not yet built**: additive-increase/multiplicative-decrease on the
 per-batch concurrency, driven by the backend in-flight counts the datastore already
@@ -397,6 +428,26 @@ batch:
 Two startup guards, both fail-fast: batch enabled without Redis, and a configured volume
 that is not actually writable by this pod.
 
+`worker.enabled` is a property of a Deployment rather than of a single replica: the chart
+renders one router Deployment, so every replica in it shares the setting. Splitting
+interactive and batch load, as Story 2 does, means a second release of the chart with its
+own `replicas` and `worker.enabled: true`, pointed at the same Redis and the same volume.
+A single install can only turn the worker on everywhere or nowhere.
+
+A response larger than `maxResponseBytes` is never truncated into the output file. The
+dispatcher reports the line as failed, and it is written to the error file with code
+`response_too_large` and counted in `request_counts.failed`, so the output file only ever
+contains whole responses.
+
+**Not built yet, and needed before the queue is fair to share:** the queue is FIFO by
+enqueue time with no per-tenant bound, so one tenant submitting many large batches delays
+everyone behind them, and nothing caps how much work may be queued at once. Two limits
+belong in the block above, `maxQueuedBatchesPerTenant` and `maxActiveBatchesPerTenant`,
+matching the per-organization batch limits OpenAI enforces for the same reason. The store
+already keeps a per-tenant index of batches, so counting a tenant's queued and running
+work needs no new state; what is missing is the admission check on create and a claim loop
+that passes over a tenant already at its active cap.
+
 #### Observability
 
 **Not yet implemented, and required before this is production-ready.** The proposed
@@ -411,7 +462,7 @@ metrics:
 | `kthena_batch_takeovers_total` | counter | — |
 | `kthena_batch_queue_depth` | gauge | — |
 
-Batch lines already appear in the existing access log, with a per-replica switch to turn
+Batch lines already appear in the existing access log, with a per-pool switch to turn
 that off for large batches.
 
 #### Backward compatibility
@@ -465,7 +516,7 @@ same, batch concurrency 1       p50  9.2ms   p99 73.5ms
 
 Measured per pod while a batch ran, the replica doing the work was at p99 102ms and the
 idle replica at p99 28ms, with the node using 1.2 of 8 cores. The cost lands on the
-replica running the batch — which is the argument for the per-replica worker switch, and
+replica running the batch — which is the argument for the per-pool worker switch, and
 for the adaptive back-off in [Flow control](#flow-control).
 
 **Memory**: 15–40 MiB against the chart's 512Mi limit, even at 50,000 requests. The input
@@ -493,8 +544,8 @@ Serial PRs, each independently reviewable:
 **A separate batch deployment.** Cleanest isolation, and batch load could never touch an
 interactive replica. Rejected because it means a second deployable to scale and operate,
 it duplicates the router's routing and scheduling or needs an RPC into it, and the issue
-explicitly asks for a router-integrated design. The per-replica worker switch recovers
-most of the isolation benefit.
+explicitly asks for a router-integrated design. Running a second router pool with the
+worker enabled recovers most of the isolation benefit without a new component.
 
 **Engine-native batch.** Would be less code. Not available: vLLM's online server has no
 batch endpoints and SGLang's has none either. Waiting on upstream engines would block the
