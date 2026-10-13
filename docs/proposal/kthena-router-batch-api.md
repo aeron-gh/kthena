@@ -102,33 +102,42 @@ The shape of it:
 flowchart TB
     client([client])
 
-    subgraph replicaA["kthena-router replica A"]
-        apiA["batch API<br/>/v1/files, /v1/batches"]
-        workerA["batch worker<br/>claim · renew · reap"]
-        chainA["router handler chain<br/>route match · rate limit<br/>fairness · KV-cache scheduling"]
+    subgraph replicaA["replica A: API and worker"]
+        apiA["batch API"]
+        workerA["batch worker"]
+        chainA["router handler chain"]
     end
 
-    subgraph replicaB["kthena-router replica B (worker disabled)"]
+    subgraph replicaB["replica B: API only"]
         apiB["batch API"]
     end
 
-    redis[("Redis<br/>jobs · queue · leases<br/>fences · checkpoints")]
-    volume[("shared volume<br/>input and result files")]
-    backends["model backends<br/>vLLM / SGLang"]
+    redis[("Redis")]
+    volume[("shared volume")]
+    backends["model backends"]
 
     client --> apiA
     client --> apiB
     apiA --> redis
-    apiB --> redis
     apiA --> volume
+    apiB --> redis
     apiB --> volume
 
-    redis -- claim with lease + fence --> workerA
+    redis -- claim --> workerA
     workerA -- one line at a time --> chainA
     chainA --> backends
     workerA -- append results, checkpoint --> volume
     workerA -- progress --> redis
 ```
+
+| Box | What it holds |
+| --- | --- |
+| batch API | `/v1/files`, `/v1/batches` |
+| batch worker | claim, renew, reap, release |
+| router handler chain | route match, rate limit, fairness, KV-cache aware scheduling |
+| Redis | jobs, queue, leases, fences, checkpoints |
+| shared volume | input and result files |
+| model backends | vLLM, SGLang |
 
 Replica B serves the API but runs no batches, which is how an operator keeps batch load
 off the replicas carrying interactive traffic. If replica A dies mid-batch, its lease
@@ -193,6 +202,107 @@ file, and every request that never ran is written to the error file with
 
 ### Design Details
 
+#### What is added
+
+All new Go code lives in one new package, `pkg/kthena-router/batch`, plus one wiring file
+under `cmd`. Sizes come from the proof of concept branch and are listed so a reviewer can
+map them onto the serial PRs in the Implementation Plan.
+
+| File | PoC size | Responsibility |
+| --- | --- | --- |
+| `batch/types.go` | 190 | `Job`, `File`, `Lease`, `Checkpoint`, `Status` |
+| `batch/store.go` | 68 | the `Store` interface, the only writer of job state |
+| `batch/redis_store.go` | 566 | Redis implementation: keys, indexes, script loading |
+| `batch/scripts/*.lua` | 7 files, 123 | `claim`, `renew`, `transition`, `checkpoint`, `cancel`, `reap`, `release` |
+| `batch/files.go` | 234 | `/v1/files`, the `FileStore` interface and its volume implementation |
+| `batch/batches.go` | 305 | `/v1/batches`: create, list, get, cancel |
+| `batch/validate.go` | 263 | input validation and the OpenAI error envelope |
+| `batch/api.go` | 328 | implements `APIExtension`, dispatches the nine endpoints |
+| `batch/worker.go` | 248 | claim loop, lease renewal, reaper, graceful release |
+| `batch/exec.go` | 734 | runs one claimed batch: stream, dispatch, checkpoint, finalize |
+| `batch/dispatch.go` | 171 | `Identity` on the request context, `HandlerDispatcher`, `batchWriter` |
+| `cmd/kthena-router/app/batch.go` | 231 | builds the components, the in-process engine and `batchIdentity` |
+
+#### How it plugs into the existing router
+
+Existing files are only added to, never changed. The Go side is 29 added lines across
+two files, and there are no deletions anywhere in the four:
+
+| Existing file | Change |
+| --- | --- |
+| `pkg/kthena-router/router/router.go` | +27: the `APIExtension` interface, an `apiExtension` field on `Router` that is nil unless the feature is on, its setter and getter, and the consult inside `HandlerFunc` |
+| `cmd/kthena-router/app/server.go` | +2: build the batch components when the feature is on |
+| `charts/kthena/charts/networking/values.yaml` | +27: the `batch` block, defaulted off |
+| `charts/kthena/charts/networking/templates/kthena-router/component/deployment.yaml` | +49: the optional volume mount |
+
+Deliberately **not** modified: the scheduler, the datastore, the fairness queue, the rate
+limiters, the access log, and `AuthMiddleware`. Batch lines reach all of them by being
+dispatched through the ordinary handler chain rather than by being special cased inside
+it. That is the one decision the rest of this section follows from.
+
+#### End to end: the steps for one batch
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant A as batch API
+    participant R as Redis
+    participant W as worker
+    participant X as executor
+    participant H as handler chain
+    participant V as volume
+
+    C->>A: POST /v1/files
+    A->>V: stream bytes
+    A->>R: write file record
+    C->>A: POST /v1/batches
+    A->>R: write job, push onto queue
+    W->>R: claim, taking lease and fence
+    W->>X: run this job
+    X->>V: open input, open segments
+    loop every line
+        X->>H: in-process request
+        H->>X: response
+        X->>V: append result
+    end
+    X->>R: checkpoint, periodically
+    X->>V: concatenate valid prefixes
+    X->>R: transition to completed
+    C->>A: GET batch, poll
+    C->>A: GET output file content
+```
+
+1. **Upload**, batch API. `POST /v1/files` with `purpose: batch` streams the JSONL body
+   into the file store and writes a `file:<id>` record owned by the caller's tenant.
+2. **Create**, batch API. `POST /v1/batches` validates the input file, writes `job:<id>`,
+   adds the batch to `fileref:<id>` so the input cannot be deleted while it is still
+   needed, and pushes the ID onto `queue`.
+3. **Claim**, worker. Every replica with the worker enabled runs a claim loop. `claim`
+   pops the oldest queued ID, increments the global `fence` counter, writes `lease:<id>`
+   with a TTL, stamps `holder` and `fence` onto the job, and adds it to `active` for the
+   reaper. Exactly one replica wins.
+4. **Execute**, executor. The owner opens the input, creates output and error segments
+   named with its fence, and dispatches lines with bounded concurrency. Each line goes
+   through the in-process engine described under Dispatch, so it is route matched, rate
+   limited, fairness queued, KV-cache scheduled and access logged exactly as a client
+   request is.
+5. **Checkpoint**, executor. Results are appended as they arrive, and `ckpt:<id>` records
+   the valid byte count per segment, the done bitmap, the counts and token usage. Every
+   write verifies the fence first.
+6. **Renew, or lose the job**, worker. The lease is renewed on a timer, and `renew`
+   returns the current status in the same round trip, which is how a running executor
+   learns it was cancelled. If the pod dies the lease expires, `reap` requeues the job,
+   and the next owner resumes from the checkpoint, skipping lines in the done bitmap.
+7. **Finalize**, executor. The valid prefix of each segment is concatenated into the
+   output and error files, their file records are written, and the job transitions to
+   `completed`.
+8. **Poll and download**, batch API. The client polls `GET /v1/batches/{id}` throughout,
+   then fetches `output_file_id` and `error_file_id`.
+
+Only steps 3 to 7 need a worker. A replica with `worker.enabled: false` still serves
+steps 1, 2 and 8, which is what lets an operator run the API everywhere and batches only
+where the load is wanted.
+
 #### API surface
 
 Served from inside the router. `Handles` claims the paths and `Serve` answers them:
@@ -236,9 +346,36 @@ stateDiagram-v2
 
 ##### Why an extension hook rather than gin routes
 
-The router's gin engine owns a `/v1/*path` catch-all for model requests. Registering
-`/v1/files` as a sibling route panics on a wildcard conflict. So the router gains a small
-seam:
+The router does not register model paths individually. It registers one catch-all that
+claims everything under `/v1` (`cmd/kthena-router/app/router.go:293-296`):
+
+```go
+v1Group := engine.Group("/v1")
+v1Group.Use(AccessLogMiddleware(cfg.defaultRouter))
+v1Group.Use(AuthMiddleware(cfg.defaultRouter))
+v1Group.Any("/*path", cfg.defaultRouter.HandlerFunc())
+```
+
+gin builds a radix tree per HTTP method, and a catch-all owns its whole subtree. So
+`/v1/files` beside `/v1/*path` is not a route that loses a priority contest, it is a
+tree gin refuses to build. On gin v1.10.0 it panics at registration:
+
+```
+'/files' in new path '/v1/files' conflicts with existing wildcard '/*path'
+in existing prefix '/v1/*path'
+```
+
+Registering the specific route first does not help, it only moves the panic:
+
+```
+catch-all wildcard '*path' in new path '/v1/*path' conflicts with existing
+path segment 'files' in existing prefix '/v1/files'
+```
+
+That leaves two real options. Drop the catch-all and enumerate every model path, which
+means the router stops forwarding any OpenAI path it has not been taught, and a new
+upstream endpoint becomes a code change. Or let the catch-all hand off the paths it does
+not own. This proposal takes the second, as a two-method seam:
 
 ```go
 type APIExtension interface {
@@ -247,10 +384,15 @@ type APIExtension interface {
 }
 ```
 
-`Router.HandlerFunc` consults the extension before parsing a model request, and only for
-`/v1/` paths, which are the ones the auth middleware already covers. When batch is
-disabled the field is nil and the check is one nil comparison. The seam is deliberately
-generic: any future non-model OpenAI endpoint can use it.
+`Router.HandlerFunc` (`pkg/kthena-router/router/router.go:284`) consults the extension
+before it parses a model request, and only for `/v1/` paths, which `AuthMiddleware`
+(`cmd/kthena-router/app/router.go:711`) has already authenticated. If `Handles` returns
+false the request continues down the existing model path unchanged. When batch is
+disabled the field is nil and the cost is one nil comparison per request.
+
+The route table itself is never touched, which is the point: batch adds a branch inside
+the catch-all instead of competing with it. Any future non-model OpenAI endpoint can use
+the same seam.
 
 #### State model
 
