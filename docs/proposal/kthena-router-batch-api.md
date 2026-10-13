@@ -462,8 +462,17 @@ is rejected on the stale fence, but the backend may have served those lines twic
 guarantee is therefore exactly-once committed output, with duplicate backend work possible
 for the lines in flight across a takeover.
 
+The two stores have to be ordered against each other. A checkpoint is only safe once the
+bytes it counts are durable, otherwise losing a node could leave Redis holding a done bit
+for a line whose output never reached the volume. So the executor syncs both open segments
+before it writes the checkpoint, which is the file-side counterpart to requiring AOF on
+Redis: whichever store is weaker sets the real guarantee.
+
 Finalizing concatenates the valid prefix of every segment into the final output and error
-files, then transitions to `completed`.
+files, then transitions to `completed`. The result files are written under deterministic
+names through `Create`, which stages a temporary file and renames it into place, so a
+finalize that is interrupted and retried by the next owner rebuilds the same bytes and
+swaps them in once.
 
 #### Dispatch
 
@@ -544,6 +553,16 @@ return `io.ReadSeekCloser` and `io.WriteCloser`. This is a small, mechanical cha
 called out here so reviewers can decide whether to make the interface abstract now or
 when the second backend arrives. The recommendation is to do it now, while there is one
 implementation to update.
+
+**A second one, in the reference counting:** `fileref` only keeps the bytes alive if the
+reference is taken atomically with the check that the file is still live. Creating a
+batch validates the input and then adds the reference as a separate step, so a delete
+landing between the two can see no references, conclude the bytes are free and remove
+them, leaving the new batch pointing at an input that is gone. The window is narrow and
+the result is a batch that fails rather than wrong output, but the sentence "a delete
+keeps the bytes until the batch is done" is not true across it. Closing it is small:
+re-read the deleted flag after taking the reference and release it if the file went away,
+or take the reference and the check in one script.
 
 #### Flow control
 
