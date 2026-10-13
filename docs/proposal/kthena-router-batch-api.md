@@ -195,7 +195,7 @@ file, and every request that never ran is written to the error file with
 | Batch traffic degrades interactive latency | Worker is opt-in per router pool; per-job and per-replica concurrency caps; adaptive back-off against backend load (phased, see [Flow control](#flow-control)) |
 | A partitioned owner keeps writing after takeover | Fence token on every state write; segment files scoped per ownership attempt, so a stale writer cannot corrupt the new owner's output |
 | A large file exhausts router memory | Input streamed line by line, results appended as they complete; measured 15–40 MiB at 50,000 requests against the chart's 512Mi limit |
-| Redis loses batch state | Document AOF or RDB persistence and `maxmemory-policy noeviction` as a requirement when batch is enabled |
+| Redis loses batch state | Require AOF with `appendfsync everysec` or stricter, plus `maxmemory-policy noeviction`, when batch is enabled. RDB alone is not sufficient: it snapshots periodically, so a crash can lose the most recent checkpoints, leases and queue entries |
 | Forged batch identity | Owner and gateway context travel in the request context, never in a header; the engine that trusts them binds no listener, and a client cannot write into a Go `context.Context` |
 | One tenant starves the queue | Not yet addressed: the queue is FIFO with no per-tenant bound. `maxQueuedBatchesPerTenant` and `maxActiveBatchesPerTenant` are proposed in [Configuration](#configuration) |
 | Abandoned files fill the volume | Files carry an expiry; a batch holds a reference on its input so a delete keeps the bytes until the batch is done; reap drops finished jobs |
@@ -205,23 +205,22 @@ file, and every request that never ran is written to the error file with
 #### What is added
 
 All new Go code lives in one new package, `pkg/kthena-router/batch`, plus one wiring file
-under `cmd`. Sizes come from the proof of concept branch and are listed so a reviewer can
-map them onto the serial PRs in the Implementation Plan.
+under `cmd`. The Implementation Plan at the end splits these into serial PRs.
 
-| File | PoC size | Responsibility |
-| --- | --- | --- |
-| `batch/types.go` | 190 | `Job`, `File`, `Lease`, `Checkpoint`, `Status` |
-| `batch/store.go` | 68 | the `Store` interface, the only writer of job state |
-| `batch/redis_store.go` | 566 | Redis implementation: keys, indexes, script loading |
-| `batch/scripts/*.lua` | 7 files, 123 | `claim`, `renew`, `transition`, `checkpoint`, `cancel`, `reap`, `release` |
-| `batch/files.go` | 234 | `/v1/files`, the `FileStore` interface and its volume implementation |
-| `batch/batches.go` | 305 | `/v1/batches`: create, list, get, cancel |
-| `batch/validate.go` | 263 | input validation and the OpenAI error envelope |
-| `batch/api.go` | 328 | implements `APIExtension`, dispatches the nine endpoints |
-| `batch/worker.go` | 248 | claim loop, lease renewal, reaper, graceful release |
-| `batch/exec.go` | 734 | runs one claimed batch: stream, dispatch, checkpoint, finalize |
-| `batch/dispatch.go` | 171 | `Identity` on the request context, `HandlerDispatcher`, `batchWriter` |
-| `cmd/kthena-router/app/batch.go` | 231 | builds the components, the in-process engine and `batchIdentity` |
+| File | Responsibility |
+| --- | --- |
+| `batch/types.go` | `Job`, `File`, `Lease`, `Checkpoint`, `Status` |
+| `batch/store.go` | the `Store` interface, the only writer of job state |
+| `batch/redis_store.go` | Redis implementation: keys, indexes, script loading |
+| `batch/scripts/*.lua` | `claim`, `renew`, `transition`, `checkpoint`, `cancel`, `reap`, `release` |
+| `batch/files.go` | `/v1/files`, the `FileStore` interface and its volume implementation |
+| `batch/batches.go` | `/v1/batches`: create, list, get, cancel |
+| `batch/validate.go` | input validation and the OpenAI error envelope |
+| `batch/api.go` | implements `APIExtension`, dispatches the nine endpoints |
+| `batch/worker.go` | claim loop, lease renewal, reaper, graceful release |
+| `batch/exec.go` | runs one claimed batch: stream, dispatch, checkpoint, finalize |
+| `batch/dispatch.go` | `Identity` on the request context, `HandlerDispatcher`, `batchWriter` |
+| `cmd/kthena-router/app/batch.go` | builds the components, the in-process engine and `batchIdentity` |
 
 #### How it plugs into the existing router
 
@@ -276,7 +275,8 @@ sequenceDiagram
    into the file store and writes a `file:<id>` record owned by the caller's tenant.
 2. **Create**, batch API. `POST /v1/batches` validates the input file, writes `job:<id>`,
    adds the batch to `fileref:<id>` so the input cannot be deleted while it is still
-   needed, and pushes the ID onto `queue`.
+   needed, and pushes the ID onto `queue`. Validation rejects a duplicate `custom_id`,
+   which is what makes the exactly-once guarantee well defined.
 3. **Claim**, worker. Every replica with the worker enabled runs a claim loop. `claim`
    pops the oldest queued ID, increments the global `fence` counter, writes `lease:<id>`
    with a TTL, stamps `holder` and `fence` onto the job, and adds it to `active` for the
@@ -319,8 +319,18 @@ Served from inside the router. `Handles` claims the paths and `Serve` answers th
 | `GET` | `/v1/batches/{id}` | batch object with live `request_counts` |
 | `POST` | `/v1/batches/{id}/cancel` | cancel |
 
-Errors use the OpenAI envelope (`message`, `type`, `param`, `code`), which differs from
-the rest of the router and is deliberate — clients parse it.
+Errors use the OpenAI shape, which nests the fields under a top-level `error` object:
+
+```json
+{"error": {"message": "...", "type": "invalid_request_error", "param": null, "code": null}}
+```
+
+This differs from the rest of the router and is deliberate, because clients parse it. The
+parity covers errors these endpoints generate themselves. A request rejected earlier, by
+`AuthMiddleware`, still gets the router's existing `{"error": "<string>"}` body, so on a
+401 an OpenAI client sees a string where it expects an object. Aligning that one response
+is a small change to the auth middleware, called out here because it sits outside the
+extension.
 
 Status values and transitions match OpenAI:
 
@@ -442,8 +452,15 @@ fresh segments of its own. Anything a dying owner half-wrote past its last check
 ignored, because the checkpoint never counted it.
 
 **A done bitmap.** The checkpoint carries a bitmap of completed line numbers. A resuming
-owner skips lines already answered. Combined with segments, a line is answered exactly
-once even when a pod dies mid-write.
+owner skips lines already answered. Combined with segments, every `custom_id` appears
+exactly once in the committed output, even when a pod dies mid-write.
+
+What the fence does not cover is work already in flight at the backend. An owner that has
+been partitioned can still have requests outstanding when its lease expires, and taking
+over does not cancel them. Its results are never committed, because every checkpoint write
+is rejected on the stale fence, but the backend may have served those lines twice. The
+guarantee is therefore exactly-once committed output, with duplicate backend work possible
+for the lines in flight across a takeover.
 
 Finalizing concatenates the valid prefix of every segment into the final output and error
 files, then transitions to `completed`.
@@ -490,6 +507,15 @@ write a value into a Go `context.Context`; the only writer is the dispatcher, in
 process, and the engine that trusts it accepts no connections. The real `AuthMiddleware` is
 left untouched, so nothing reachable from the network is taught to trust a context-carried
 identity.
+
+One piece of authenticated state is not reproduced. `AuthMiddleware` also stores the
+parsed token under `common.JWTTokenKey`, which is what `auth.ClaimFromContext` reads for a
+ModelServer whose session key source is `JWTClaim`. `batchIdentity` does not set it, so
+that session key resolves empty on batch lines and those lines are not sticky. Replaying
+the token itself would put a bearer credential in Redis for the life of the batch, and it
+can expire mid-run, so the proposed fix is to resolve the session key once when the batch
+is created and replay that value beside the tenant and gateway context. Flagged here for a
+decision rather than settled.
 
 Two details matter:
 
@@ -633,6 +659,8 @@ E2E on kind, with two router replicas sharing one volume and one Redis, against 
    ModelRoute.
 
 ### Evidence from the proof of concept
+
+The branch is [`poc/batch-api`](https://github.com/aeron-gh/kthena/tree/poc/batch-api).
 
 Measured on kind: two router replicas, one shared volume, one Redis, `llm-d-inference-sim`
 as the backend. Single node, so ReadWriteOnce sufficed there; a real multi-node cluster
